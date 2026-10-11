@@ -11,7 +11,7 @@
     const PROTECT_MS = 2000;     // spawn protection
 
     const M = {
-        mode: 'solo',            // solo | public | create | join
+        mode: 'solo',            // solo | teams | create | join
         joinCode: '',
         ws: null,
         phase: 'idle',           // idle | connecting | waiting | found | playing | over
@@ -55,10 +55,10 @@
             <div class="sub">CHOOSE HOW TO PLAY</div>
             <button class="btn green" data-mode="solo">SOLO &middot; WAVES VS BOTS</button>
             <div class="mp-divider"></div>
-            <button class="btn" data-mode="public">1V1 &middot; PUBLIC MATCH (RANDOM MAP)</button>
-            <button class="btn" data-mode="create">1V1 &middot; CREATE PRIVATE ROOM</button>
+            <button class="btn" data-mode="teams">10V10 &middot; TEAM BATTLE (20 PLAYERS)</button>
+            <button class="btn" data-mode="create">PRIVATE ROOM</button>
             <input id="mp-code-input" class="input-field" placeholder="ROOM CODE" maxlength="4" style="text-transform:uppercase;text-align:center">
-            <button class="btn" data-mode="join">1V1 &middot; JOIN WITH CODE</button>
+            <button class="btn" data-mode="join">JOIN PRIVATE ROOM</button>
             <div class="mp-msg" id="mp-mode-msg"></div>
             <button class="btn grey" data-mode="cancel">CANCEL</button>
         </div></div>`);
@@ -132,7 +132,7 @@
     /* ---------- deployment flow tweaks ---------- */
     window.showDeployStep = function (step) {
         const oneVone = M.mode !== 'solo';
-        const skipMap = M.mode === 'public' || M.mode === 'join';
+        const skipMap = M.mode === 'teams' || M.mode === 'join';
         if (skipMap && step === 3) {              // map is random / chosen by the room host
             $('operator-select-overlay').style.display = 'none';
             window.deployToCombat();
@@ -140,13 +140,13 @@
         }
         _showStep(step);
         if (!oneVone) return;
-        const names = { public: '1V1 PUBLIC', create: '1V1 PRIVATE', join: '1V1 JOIN' };
+        const names = { teams: '10V10 TEAM BATTLE', create: 'PRIVATE ROOM', join: 'PRIVATE ROOM JOIN' };
         const total = skipMap ? 2 : 3;
         $('deploy-step-label').textContent = 'DEPLOYMENT // ' + names[M.mode] + ' // STEP 0' + step + ' OF 0' + total;
         $('deploy-step-count').textContent = '0' + step + ' / 0' + total;
         if (skipMap && step === 2) {
-            $('deploy-next-btn').textContent = M.mode === 'public' ? '\u25B6  FIND MATCH' : '\u25B6  JOIN ROOM';
-            $('ability-help').textContent = M.mode === 'public' ? 'Public matches use a random map.' : 'The room host picked the map.';
+            $('deploy-next-btn').textContent = M.mode === 'teams' ? '\u25B6  FIND TEAM MATCH' : '\u25B6  JOIN ROOM';
+            $('ability-help').textContent = M.mode === 'teams' ? 'Team battles support up to 20 players (10 per team).' : 'The room host picked the map.';
         }
         if (M.mode === 'create' && step === 3) $('deploy-next-btn').textContent = '\u25B6  CREATE ROOM';
     };
@@ -158,7 +158,7 @@
 
     /* ---------- waiting overlay ---------- */
     function showWait(msg, o = {}) {
-        $('mp-wait-title').textContent = o.title || '1V1 MATCH';
+        $('mp-wait-title').textContent = o.title || (M.mode === 'teams' ? '10V10 TEAM BATTLE' : 'PRIVATE MATCH');
         $('mp-wait-sub').textContent = o.sub || '';
         const code = $('mp-wait-code');
         code.style.display = o.code ? 'block' : 'none';
@@ -209,7 +209,7 @@
         try { ws = new WebSocket(url); } catch (e) { fail('COULD NOT CONNECT TO THE SERVER'); return; }
         M.ws = ws;
         ws.onopen = () => {
-            if (M.mode === 'public') send(Object.assign({ t: 'find' }, profile()));
+            if (M.mode === 'teams') send(Object.assign({ t: 'team' }, profile()));
             else if (M.mode === 'create') send(Object.assign({ t: 'create', map: $('map-select').value }, profile()));
             else if (M.mode === 'join') send(Object.assign({ t: 'join', code: M.joinCode }, profile()));
         };
@@ -225,10 +225,11 @@
 
     function handle(m) {
         switch (m.t) {
-            case 'waiting': M.phase = 'waiting'; showWait('SEARCHING FOR AN OPPONENT...', { sub: 'PUBLIC MATCH \u00B7 RANDOM MAP' }); break;
+            case 'waiting': M.phase = 'waiting'; showWait('SEARCHING FOR PLAYERS...', { title: '10V10 TEAM BATTLE', sub: 'UP TO 20 PLAYERS · RANDOM MAP' }); break;
             case 'created': M.phase = 'waiting'; showWait('WAITING FOR YOUR FRIEND TO JOIN...', { code: m.code, sub: 'PRIVATE ROOM \u00B7 SHARE THIS CODE' }); break;
             case 'err': fail(m.msg || 'SOMETHING WENT WRONG'); break;
             case 'start': onFound(m); break;
+            case 'roster': if (m.players && M.opp) { const first = m.players.find(p => p.id !== M.idx && p.team !== M.team); if (first) M.opp.name = first.name; } break;
             case 'go': onGo(); break;
             case 's': onState(m); break;
             case 'f': onRemoteShot(m); break;
@@ -241,12 +242,12 @@
     /* ---------- match found / ready ---------- */
     function onFound(m) {
         M.phase = 'found';
-        M.idx = m.you; M.limit = m.limit || 10; M.kills = [0, 0];
+        M.idx = m.you; M.team = m.team || 0; M.limit = m.limit || 10; M.kills = m.kills || [0, 0];
         M.pendingStart = m;
         M.opp = { name: m.opp.name, op: m.opp.op, w: m.opp.w, mesh: null, alive: true, seen: false, hp: 100, walk: 0, yaw: 0,
                   pos: new THREE.Vector3(0, -100, 0), tx: 0, ty: 0, tz: 0, tyaw: 0 };
         const label = MAPS[m.map] ? MAPS[m.map].label : m.map;
-        showWait('MAP: ' + label, { title: 'MATCH FOUND', sub: 'VS ' + m.opp.name.toUpperCase(), ready: true, cancelLabel: 'LEAVE' });
+        showWait('MAP: ' + label, { title: M.mode === 'teams' ? 'TEAM MATCH FOUND' : 'MATCH FOUND', sub: M.mode === 'teams' ? '10V10 · TEAM ' + (M.team + 1) : 'VS ' + m.opp.name.toUpperCase(), ready: true, cancelLabel: 'LEAVE' });
     }
 
     $('mp-ready-btn').addEventListener('click', () => {
