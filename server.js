@@ -1,6 +1,6 @@
 'use strict';
 /*
- * Tactical FPS Arena - 1v1 matchmaking server
+ * Tactical FPS Arena - 10v10 team matchmaking server
  * - Serves index.html and multiplayer.js over HTTP
  * - WebSocket on the same port: public queue, private rooms, relay of player state
  */
@@ -20,8 +20,9 @@ const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const STATIC = { '/': 'index.html', '/index.html': 'index.html', '/multiplayer.js': 'multiplayer.js' };
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8' };
 
-const queue = [];          // sockets waiting in the public queue
+const queue = [];          // sockets waiting for a 20-player team battle
 const rooms = new Map();   // private rooms: code -> { host, map }
+const TEAM_MATCH_SIZE = 20;
 
 /* ---------- HTTP (static files) ---------- */
 const server = http.createServer((req, res) => {
@@ -85,20 +86,22 @@ function leaveMatch(ws) {
     if (!m.over) endMatch(m, 1 - ws.idx, 'left');
 }
 
-function startMatch(a, b, map) {
-    const match = { players: [a, b], kills: [0, 0], ready: [false, false], started: false, over: false, map, timer: null };
-    [a, b].forEach((ws, idx) => { ws.match = match; ws.idx = idx; ws.lastDeath = 0; });
-    for (let idx = 0; idx < 2; idx++) {
-        const me = match.players[idx], other = match.players[1 - idx];
-        send(me, { t: 'start', map, you: idx, limit: KILL_LIMIT, opp: other.prof });
-    }
+function startMatch(players, map, teamMode = false) {
+    const match = { players, kills: teamMode ? [0, 0] : [0, 0], ready: players.map(() => false), started: false, over: false, map, teamMode, timer: null };
+    players.forEach((ws, idx) => { ws.match = match; ws.idx = idx; ws.team = teamMode ? (idx % 2) : 0; ws.lastDeath = 0; });
+    players.forEach((me, idx) => {
+        const enemies = players.filter((p, j) => teamMode ? p.team !== me.team : j !== idx);
+        send(me, { t: 'start', map, you: idx, team: me.team, teamMode, limit: KILL_LIMIT, kills: match.kills,
+            opp: (enemies[0] || players[(idx + 1) % players.length]).prof,
+            players: players.map((p, j) => ({ id: j, name: p.prof.name, op: p.prof.op, w: p.prof.w, team: p.team })) });
+    });
     match.timer = setTimeout(() => { if (!match.started) endMatch(match, -1, 'timeout'); }, READY_TIMEOUT_MS);
 }
 
 /* ---------- WebSocket protocol ---------- */
 wss.on('connection', (ws) => {
     ws.isAlive = true;
-    ws.match = null; ws.idx = 0; ws.room = null; ws.prof = null; ws.lastDeath = 0;
+    ws.match = null; ws.idx = 0; ws.team = 0; ws.room = null; ws.prof = null; ws.lastDeath = 0;
     ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (data) => {
@@ -108,6 +111,21 @@ wss.on('connection', (ws) => {
         const match = ws.match;
 
         switch (m.t) {
+            case 'team': {
+                if (match && !match.over) return;
+                leaveMatch(ws); leaveLobby(ws);
+                ws.prof = profile(m);
+                if (!ws._teamQueuedAt) ws._teamQueuedAt = Date.now();
+                queue.push(ws);
+                send(ws, { t: 'waiting', size: queue.length, max: TEAM_MATCH_SIZE });
+                while (queue.length && queue[0].readyState !== 1) queue.shift();
+                if (queue.length >= TEAM_MATCH_SIZE) {
+                    const players = queue.splice(0, TEAM_MATCH_SIZE);
+                    players.forEach(p => { p._teamQueuedAt = 0; });
+                    startMatch(players, randomMap(), true);
+                }
+                break;
+            }
             case 'find': {
                 if (match && !match.over) return;
                 leaveMatch(ws); leaveLobby(ws);
@@ -147,7 +165,7 @@ wss.on('connection', (ws) => {
             case 'ready': {
                 if (!match || match.over || match.started) return;
                 match.ready[ws.idx] = true;
-                if (match.ready[0] && match.ready[1]) {
+                if (match.ready.every(Boolean)) {
                     match.started = true;
                     clearTimeout(match.timer);
                     for (const p of match.players) send(p, { t: 'go' });
@@ -156,21 +174,21 @@ wss.on('connection', (ws) => {
             }
             case 's': {   // player state -> opponent
                 if (!match || !match.started || match.over) return;
-                send(match.players[1 - ws.idx], {
-                    t: 's', x: num(m.x, -200, 200), y: num(m.y, -50, 100), z: num(m.z, -200, 200),
+                for (const recipient of match.players) { if (recipient !== ws) send(recipient, {
+                    t: 's', id: ws.idx, team: ws.team, x: num(m.x, -200, 200), y: num(m.y, -50, 100), z: num(m.z, -200, 200),
                     yaw: num(m.yaw, -100, 100), pitch: num(m.pitch, -3, 3), hp: num(m.hp, 0, 100), al: m.al ? 1 : 0
-                });
+                }); }
                 break;
             }
             case 'f': {   // shot fired (visual tracer + sound for the opponent)
                 if (!match || !match.started || match.over) return;
-                send(match.players[1 - ws.idx], { t: 'f', o: vec3(m.o), d: vec3(m.d), w: Math.floor(num(m.w, 0, 99, 0)) });
+                for (const recipient of match.players) if (recipient !== ws && (!match.teamMode || recipient.team !== ws.team)) send(recipient, { t: 'f', id: ws.idx, team: ws.team, o: vec3(m.o), d: vec3(m.d), w: Math.floor(num(m.w, 0, 99, 0)) });
                 break;
             }
             case 'h': {   // damage dealt to the opponent
                 if (!match || !match.started || match.over) return;
                 const dmg = num(m.dmg, 0, 400);
-                if (dmg > 0) send(match.players[1 - ws.idx], { t: 'h', dmg, head: !!m.head });
+                if (dmg > 0) for (const recipient of match.players) if (recipient !== ws && (!match.teamMode || recipient.team !== ws.team)) send(recipient, { t: 'h', from: ws.idx, dmg, head: !!m.head });
                 break;
             }
             case 'd': {   // I died -> opponent scores
@@ -178,9 +196,9 @@ wss.on('connection', (ws) => {
                 const now = Date.now();
                 if (now - ws.lastDeath < 1500) return;
                 ws.lastDeath = now;
-                const killer = 1 - ws.idx;
+                const killer = match.teamMode ? 1 - ws.team : 1 - ws.idx;
                 match.kills[killer]++;
-                for (const p of match.players) send(p, { t: 'k', kills: match.kills, killer });
+                for (const p of match.players) send(p, { t: 'k', kills: match.kills, killer, teamMode: match.teamMode });
                 if (match.kills[killer] >= KILL_LIMIT) endMatch(match, killer, 'limit');
                 break;
             }
